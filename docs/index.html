@@ -1,43 +1,27 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-
-  <!--
-    Prevent caching of index.html itself, so that
-    its fetch() code always runs on every visit.
-  -->
+  <meta charset="UTF-8"/>
+  <!-- Prevent any caching of this HTML itself -->
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate"/>
-  <meta http-equiv="Pragma" content="no-cache"/>
-  <meta http-equiv="Expires" content="0"/>
-
-  <title>Redirecting…</title>
-
+  <meta http-equiv="Pragma"        content="no-cache"/>
+  <meta http-equiv="Expires"       content="0"/>
+  <style>/* hide any flash of content */ body{margin:0;visibility:hidden;}</style>
   <script>
     (async () => {
       try {
-        // Fetch the latest JSON, bypassing any cache
-        const resp = await fetch("redirect.json", { cache: "no-store" });
+        // Always fetch the latest redirect.json
+        const resp = await fetch(`redirect.json?cb=${Date.now()}`, { cache: "no-store" });
         const { targetURL } = await resp.json();
-        // Immediately redirect
-        window.location.replace(targetURL);
+        // Append a cache-busting query to the destination
+        const sep = targetURL.includes('?') ? '&' : '?';
+        window.location.replace(`${targetURL}${sep}cb=${Date.now()}`);
       } catch (err) {
         console.error("Redirect failed:", err);
       }
     })();
   </script>
+  <title></title>
 </head>
-<body>
-  <p>Redirecting… if you’re not sent in a sec, <a id="fallback">click here</a>.</p>
-  <script>
-    // In case JS redirect stalls, fill the fallback link
-    fetch("redirect.json", { cache: "no-store" })
-      .then(r => r.json())
-      .then(({ targetURL }) => {
-        const a = document.getElementById("fallback");
-        a.href = targetURL;
-        a.textContent = targetURL;
-      });
-  </script>
-</body>
+<body></body>
 </html>
