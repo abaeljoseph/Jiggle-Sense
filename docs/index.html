@@ -3,34 +3,41 @@
 <head>
   <meta charset="UTF-8" />
 
-  <!-- 1) prevent any caching of this page -->
-  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
-  <meta http-equiv="Pragma"        content="no-cache" />
-  <meta http-equiv="Expires"       content="0" />
-
-  <!-- 2) your one-and-only redirect URL -->
-  <script>
-    const targetURL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ";  
-    // inject instant meta-refresh
-    document.write(
-      '<meta http-equiv="refresh" content="0;url=' +
-        targetURL.replace(/"/g, "%22") +
-      '"/>'
-    );
-  </script>
+  <!--
+    Prevent caching of index.html itself, so that
+    its fetch() code always runs on every visit.
+  -->
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate"/>
+  <meta http-equiv="Pragma" content="no-cache"/>
+  <meta http-equiv="Expires" content="0"/>
 
   <title>Redirecting…</title>
+
   <script>
-    // JS fallback
-    window.location.replace(targetURL);
+    (async () => {
+      try {
+        // Fetch the latest JSON, bypassing any cache
+        const resp = await fetch("redirect.json", { cache: "no-store" });
+        const { targetURL } = await resp.json();
+        // Immediately redirect
+        window.location.replace(targetURL);
+      } catch (err) {
+        console.error("Redirect failed:", err);
+      }
+    })();
   </script>
 </head>
 <body>
-  <p>Redirecting to <a id="redirect-link"></a></p>
+  <p>Redirecting… if you’re not sent in a sec, <a id="fallback">click here</a>.</p>
   <script>
-    const link = document.getElementById("redirect-link");
-    link.href = targetURL;
-    link.textContent = targetURL;
+    // In case JS redirect stalls, fill the fallback link
+    fetch("redirect.json", { cache: "no-store" })
+      .then(r => r.json())
+      .then(({ targetURL }) => {
+        const a = document.getElementById("fallback");
+        a.href = targetURL;
+        a.textContent = targetURL;
+      });
   </script>
 </body>
 </html>
