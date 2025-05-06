@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+
+  <!-- change this URL only once -->
+  <script>
+    const targetURL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ";
+    // inject meta-refresh
+    document.write(
+      '<meta http-equiv="refresh" content="0;url=' +
+        targetURL.replace(/"/g, "%22") +
+      '"/>'
+    );
+  </script>
+
+  <title>Redirecting…</title>
+  <script>
+    // JS fallback
+    window.location.replace(targetURL);
+  </script>
+</head>
+<body>
+  <p>
+    Redirecting to
+    <a id="redirect-link" href="">your destination</a>
+  </p>
+
+  <script>
+    // set link text & href
+    const link = document.getElementById("redirect-link");
+    link.href = targetURL;
+    link.textContent = targetURL;
+  </script>
+</body>
+</html>
