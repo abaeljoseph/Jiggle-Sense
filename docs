@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+
+  <!-- define your target URL exactly once here: -->
+  <script>
+    const targetURL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ";
+    // inject the meta-refresh for instant redirect
+    document.write(
+      '<meta http-equiv="refresh" content="0;url=' +
+        targetURL.replace(/"/g, "%22") +
+      '"/>'
+    );
+  </script>
+
+  <title>Redirecting…</title>
+  <script>
+    // fallback in case meta-refresh is ignored
+    window.location.replace(targetURL);
+  </script>
+</head>
+<body>
+  <p>
+    Redirecting to
+    <a id="redirect-link" href="">your destination</a>
+  </p>
+
+  <script>
+    // set the body link text & href from the same variable
+    const link = document.getElementById("redirect-link");
+    link.href = targetURL;
+    link.textContent = targetURL;
+  </script>
+</body>
+</html>
