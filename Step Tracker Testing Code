@@ -1,8 +1,9 @@
 /*  STEP-TRACKER  (ESP32-C3  +  ADXL335  +  GC9A01A)
     Wheel-style menu
-      • Steps  → distance, kcal, goal bar
-      • WPIR   → grey/green/yellow/red pace bubble
-    Now includes:
+      • Clock Mode
+      • Steps Count (with integrated pace bubble)
+      • Calibrate ADXL
+    Features:
       • 1-pole low-pass on |a|
       • 8-step cadence average
       • 4-state pace with debounce + idle timeout
@@ -15,7 +16,7 @@
 /* ---------- USER SETTINGS ---------- */
 float  stride_cm     = 70.0;   // personalise!
 float  weight_kg     = 70.0;
-const  int    dailyGoal     = 8000;
+const int    dailyGoal     = 8000;
 
 /* WPIR thresholds (km h-1) */
 const float walkJog         = 4.5;
@@ -34,7 +35,7 @@ Adafruit_GC9A01A tft(TFT_CS, TFT_DC);
 #define RED      0xF800
 #define BLUE     0x001F
 #define YELLOW   0xFFE0
-#define GREY     0x8410      // mid-grey for idle bubble
+#define GREY     0x8410      // mid-grey
 #define DARKGREY 0x7BEF
 
 /* ---------- PINS ---------- */
@@ -46,17 +47,17 @@ Adafruit_GC9A01A tft(TFT_CS, TFT_DC);
 #define ADXL_Z         A0
 
 /* ---------- MENU ---------- */
-const char* menuItems[] = { "Clock Mode", "Steps Count", "Calibrate ADXL", "WPIR" };
-const char* menuIcons[] = { "CLK", "STP", "CAL", "PCE" };
+const char* menuItems[] = { "Clock Mode", "Steps Count", "Calibrate ADXL" };
+const char* menuIcons[] = { "CLK", "STP", "CAL" };
 const uint8_t menuLen = sizeof(menuItems) / sizeof(menuItems[0]);
 uint8_t menuIdx = 0;
 
-enum AppState { MENU, CLOCK, STEPS, CALIB, WPIR };
+enum AppState { MENU, CLOCK, STEPS, CALIB };
 AppState state = MENU;
 
 /* ---------- BUTTON DEBOUNCE ---------- */
 const uint16_t DB_MS = 50, LONG_MS = 800;
-bool lastUD[2] = { HIGH, HIGH }, stabUD[2] = { HIGH, HIGH }; 
+bool lastUD[2] = { HIGH, HIGH }, stabUD[2] = { HIGH, HIGH };
 unsigned long edgeUD[2] = { 0, 0 };
 bool selLast = LOW, selStable = LOW, longFired = false;
 unsigned long selEdge = 0, selStart = 0;
@@ -91,7 +92,7 @@ unsigned long stepTS[CAD_BUF] = { 0 };
 uint8_t stepHead = 0;
 float cadenceSPM = 0;
 
-/* new step-detector tuning */
+/* step-detector tuning */
 const double peakThreshold   = 1.20;   // g – minimum filtered magnitude for a peak
 const double valleyThreshold = 1.00;   // g – must drop below to arm next step
 const unsigned long stepCooldown = 200; // ms – min time between counts
@@ -109,8 +110,7 @@ void drawWheel() {
   for (uint8_t i = 0; i < menuLen; i++) {
     int8_t off = (i - menuIdx + menuLen) % menuLen;
     float ang = radians(-90 + off * stepAng);
-    int16_t x = cx + rIcon * cos(ang),
-            y = cy + rIcon * sin(ang);
+    int16_t x = cx + rIcon * cos(ang), y = cy + rIcon * sin(ang);
     uint8_t sz = (off == 0) ? 3 : 2;
     uint16_t col = (off == 0) ? GREEN : WHITE;
     tft.setTextSize(sz);
@@ -139,6 +139,7 @@ void drawClockFace() {
     tft.print(i);
   }
 }
+
 void hands() {
   tft.drawLine(cx, cy, pHX, pHY, BLACK);
   tft.drawLine(cx, cy, pMX, pMY, BLACK);
@@ -157,60 +158,56 @@ void hands() {
   tft.drawLine(cx, cy, pSX, pSY, GREEN);
 }
 
-/* ---------- STEPS SCREEN ---------- */
+/* ---------- STEPS + MINI WPIR ---------- */
 void showSteps() {
+  // draw steps, distance, calories, goal bar
   float dist_km = (stepCount * stride_cm) / 100000.0;
   float kcal    = dist_km * weight_kg * 1.036;
   tft.fillScreen(BLACK);
   tft.setTextColor(WHITE);
   tft.setTextSize(3);
-  tft.setCursor(30, 60);
-  tft.print("Steps:");
-  tft.setCursor(60, 100);
-  tft.print(stepCount);
+  tft.setCursor(30,  60); tft.print("Steps:");
+  tft.setCursor(60, 100); tft.print(stepCount);
   tft.setTextSize(2);
-  tft.setCursor(20, 140);
-  tft.printf("Dist: %.2f km", dist_km);
-  tft.setCursor(20, 160);
-  tft.printf("Cal : %.0f", kcal);
+  tft.setCursor(20, 140); tft.printf("Dist: %.2f km", dist_km);
+  tft.setCursor(20, 160); tft.printf("Cal : %.0f", kcal);
   tft.fillRect(10, 210, 220, 10, DARKGREY);
   int w = map(min(stepCount, dailyGoal), 0, dailyGoal, 0, 220);
   tft.fillRect(10, 210, w, 10, GREEN);
-}
 
-/* ---------- WPIR 4-STATE BUBBLE ---------- */
-void paceBubble() {
-  bool idle = (millis() - lastStepT > idleTimeout);
+  // compute pace state
+  bool idle       = (millis() - lastStepT > idleTimeout);
   float speed_kmh = (stride_cm/100.0) * cadenceSPM * 0.06;
-  uint8_t desiredState;
-  if (idle)                    desiredState = 0;
-  else if (speed_kmh > jogRun) desiredState = 3;
-  else if (speed_kmh > walkJog)desiredState = 2;
-  else                         desiredState = 1;
+  uint8_t desired;
+  if      (idle)                desired = 0;
+  else if (speed_kmh > jogRun)  desired = 3;
+  else if (speed_kmh > walkJog) desired = 2;
+  else                           desired = 1;
 
-  static uint8_t state = 0;
+  // debounce pace state
+  static uint8_t  paceState = 0;
   static unsigned long stableSince = 0;
-  if (desiredState != state) {
+  if (desired != paceState) {
     if (millis() - stableSince > 600) {
-      state = desiredState;
+      paceState = desired;
     }
   } else {
     stableSince = millis();
   }
 
+  // draw mini-bubble top-right
   static const uint16_t colLUT[4] = { GREY, GREEN, YELLOW, RED };
-  static const char*    txtLUT[4] = { "STANDING", "WALKING", "JOGGING", "RUNNING" };
-
-  tft.fillScreen(BLACK);
-  tft.fillCircle(cx, cy - 20, 40, colLUT[state]);
-  tft.setTextSize(2);
+  static const char*    txtLUT[4] = { "STAND", "WALK", "JOGG", "RUN" };
+  const uint8_t bx = 170, by = 70, br = 30;
+  tft.fillCircle(bx, by, br, colLUT[paceState]);
+  tft.setTextSize(1);
   tft.setTextColor(WHITE, BLACK);
-  int16_t w = strlen(txtLUT[state]) * 12;
-  tft.setCursor(cx - w/2, cy + 35);
-  tft.print(txtLUT[state]);
+  int16_t tx = bx - (strlen(txtLUT[paceState]) * 6 / 2);
+  int16_t ty = by - 4;
+  tft.setCursor(tx, ty);
+  tft.print(txtLUT[paceState]);
 }
 
-/* ---------- CALIBRATION ---------- */
 /* ---------- CALIBRATION ---------- */
 void calibrate() {
   struct F { const char* l; uint8_t p; double* s; } f[6] = {
@@ -222,7 +219,7 @@ void calibrate() {
   const uint16_t N = 100;
   const uint32_t wait = 5000;
 
-  // 1. collect + and - readings
+  // collect + and - readings
   for (uint8_t i = 0; i < 6; i++) {
     tft.fillScreen(BLACK);
     tft.setTextSize(2);
@@ -243,37 +240,26 @@ void calibrate() {
     else           neg[i/2] = sum / N;
   }
 
-  // 2. compute zero‐offsets
+  // compute zero-offsets
   zeroX = (pos[0] + neg[0]) / 2;
   zeroY = (pos[1] + neg[1]) / 2;
   zeroZ = (pos[2] + neg[2]) / 2;
 
-  // 3. display results: raw and in g (via your 1/330 conversion)
-  // … after zeroX/zeroY/zeroZ calculation …
+  // show zero-offsets only
+  tft.fillScreen(BLACK);
+  tft.setTextSize(2);
+  tft.setTextColor(WHITE);
+  tft.setCursor(10,  40);
+  tft.printf("X: %.0f (%.2fg)", zeroX, (zeroX - zeroX)/330.0);
+  tft.setCursor(10,  70);
+  tft.printf("Y: %.0f (%.2fg)", zeroY, (zeroY - zeroY)/330.0);
+  tft.setCursor(10, 100);
+  tft.printf("Z: %.0f (%.2fg)", zeroZ, (zeroZ - zeroZ)/330.0);
 
-  // … after you compute zeroX, zeroY, zeroZ …
-
-// show just X/Y/Z zero‐offsets and g
-tft.fillScreen(BLACK);
-tft.setTextSize(2);
-tft.setTextColor(WHITE);
-
-tft.setCursor(10,  40);
-tft.printf("X: %.0f (%.2fg)", zeroX, (zeroX-zeroX)/330.0);
-
-tft.setCursor(10,  70);
-tft.printf("Y: %.0f (%.2fg)", zeroY, (zeroY-zeroY)/330.0);
-
-tft.setCursor(10, 100);
-tft.printf("Z: %.0f (%.2fg)", zeroZ, (zeroZ-zeroZ)/330.0);
-
-delay(3000);
-state = MENU;
-drawWheel();
-
-
+  delay(3000);
+  state = MENU;
+  drawWheel();
 }
-
 
 /* ---------- SETUP ---------- */
 void setup() {
@@ -282,7 +268,7 @@ void setup() {
   tft.setRotation(0);
   tft.fillScreen(BLACK);
   pinMode(BUTTON_DOWN, INPUT_PULLUP);
-  pinMode(BUTTON_UP, INPUT_PULLUP);
+  pinMode(BUTTON_UP,   INPUT_PULLUP);
   pinMode(BUTTON_SELECT, INPUT_PULLDOWN);
   drawWheel();
 }
@@ -299,25 +285,21 @@ void loop() {
     if (up)   { menuIdx = (menuIdx - 1 + menuLen) % menuLen; drawWheel(); }
   }
 
-  // 2. SELECT button handling
+  // 2. SELECT handling
   bool selRaw = digitalRead(BUTTON_SELECT);
   if (selRaw != selLast) {
-    selEdge = now;
-    selLast = selRaw;
+    selEdge = now; selLast = selRaw;
   }
   if (now - selEdge > DB_MS && selRaw != selStable) {
     selStable = selRaw;
     if (selStable == HIGH) {
-      selStart = now;
-      longFired = false;
+      selStart = now; longFired = false;
     } else if (!longFired && now - selStart < LONG_MS) {
-      // short press
       if (state == MENU) {
         switch (menuIdx) {
           case 0: state = CLOCK; tft.fillScreen(BLACK); drawClockFace(); break;
           case 1: state = STEPS; stepCount = 0; showSteps(); break;
           case 2: state = CALIB; calibrate(); break;
-          case 3: state = WPIR;  paceBubble(); break;
         }
       } else if (state == STEPS) {
         stepCount = 0; showSteps();
@@ -332,19 +314,15 @@ void loop() {
     }
   }
 
-  // 3. Read ADXL, compute magnitude in g
-  int xr = analogRead(ADXL_X);
-  int yr = analogRead(ADXL_Y);
-  int zr = analogRead(ADXL_Z);
-  double xg = (xr - zeroX) / 330.0;
-  double yg = (yr - zeroY) / 330.0;
-  double zg = (zr - zeroZ) / 330.0;
+  // 3. Read ADXL & magnitude
+  int xr = analogRead(ADXL_X), yr = analogRead(ADXL_Y), zr = analogRead(ADXL_Z);
+  double xg = (xr - zeroX)/330.0, yg = (yr - zeroY)/330.0, zg = (zr - zeroZ)/330.0;
   double mag = sqrt(xg*xg + yg*yg + zg*zg);
 
-  // 4. Low-pass filter the magnitude
-  filtMag = filtMag * (1.0 - alpha) + mag * alpha;
+  // 4. Low-pass filter
+  filtMag = filtMag*(1.0 - alpha) + mag*alpha;
 
-  // 5. Two-state step detector
+  // 5. Step detector state machine
   switch (stepState) {
     case STEP_IDLE:
       if (filtMag > peakThreshold) {
@@ -360,7 +338,6 @@ void loop() {
         stepState = STEP_IDLE;
 
         if (state == STEPS) showSteps();
-        if (state == WPIR)  paceBubble();
 
         // cadence buffer
         stepTS[stepHead] = now;
@@ -392,9 +369,9 @@ void loop() {
     }
   }
 
-  // 7. Serial output for plotting
-  Serial.print(xg, 3); Serial.print('\t');
-  Serial.print(yg, 3); Serial.print('\t');
-  Serial.print(zg, 3); Serial.print('\t');
-  Serial.println(filtMag, 3);
+  // 7. Serial debug
+  Serial.print(xg,3); Serial.print('\t');
+  Serial.print(yg,3); Serial.print('\t');
+  Serial.print(zg,3); Serial.print('\t');
+  Serial.println(filtMag,3);
 }
