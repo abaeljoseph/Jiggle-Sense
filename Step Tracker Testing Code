@@ -3,6 +3,7 @@
       • Clock Mode
       • Steps Count (with integrated pace bubble)
       • Calibrate ADXL
+      • Live G (real-time X/Y/Z in g)
     Features:
       • 1-pole low-pass on |a|
       • 8-step cadence average
@@ -47,12 +48,12 @@ Adafruit_GC9A01A tft(TFT_CS, TFT_DC);
 #define ADXL_Z         A0
 
 /* ---------- MENU ---------- */
-const char* menuItems[] = { "Clock Mode", "Steps Count", "Calibrate ADXL" };
-const char* menuIcons[] = { "CLK", "STP", "CAL" };
+const char* menuItems[] = { "Clock Mode", "Steps Count", "Calibrate ADXL", "Live G" };
+const char* menuIcons[] = { "CLK", "STP", "CAL", "GRA" };
 const uint8_t menuLen = sizeof(menuItems) / sizeof(menuItems[0]);
 uint8_t menuIdx = 0;
 
-enum AppState { MENU, CLOCK, STEPS, CALIB };
+enum AppState { MENU, CLOCK, STEPS, CALIB, LIVEG };
 AppState state = MENU;
 
 /* ---------- BUTTON DEBOUNCE ---------- */
@@ -102,6 +103,9 @@ StepState stepState = STEP_IDLE;
 unsigned long lastStep = 0, lastStepT = 0;
 int stepCount = 0;
 
+/* for Live G updates */
+unsigned long lastG = 0;
+
 /* ---------- DRAW WHEEL MENU ---------- */
 void drawWheel() {
   tft.fillScreen(BLACK);
@@ -139,7 +143,6 @@ void drawClockFace() {
     tft.print(i);
   }
 }
-
 void hands() {
   tft.drawLine(cx, cy, pHX, pHY, BLACK);
   tft.drawLine(cx, cy, pMX, pMY, BLACK);
@@ -195,7 +198,7 @@ void showSteps() {
     stableSince = millis();
   }
 
-  // draw mini-bubble top-right
+  // draw mini-bubble
   static const uint16_t colLUT[4] = { GREY, GREEN, YELLOW, RED };
   static const char*    txtLUT[4] = { "STAND", "WALK", "JOGG", "RUN" };
   const uint8_t bx = 170, by = 70, br = 30;
@@ -250,15 +253,24 @@ void calibrate() {
   tft.setTextSize(2);
   tft.setTextColor(WHITE);
   tft.setCursor(10,  40);
-  tft.printf("X: %.0f (%.2fg)", zeroX, (zeroX - zeroX)/330.0);
+  tft.printf("X: %.0f (%.2fg)", zeroX, (zeroX-zeroX)/330.0);
   tft.setCursor(10,  70);
-  tft.printf("Y: %.0f (%.2fg)", zeroY, (zeroY - zeroY)/330.0);
+  tft.printf("Y: %.0f (%.2fg)", zeroY, (zeroY-zeroY)/330.0);
   tft.setCursor(10, 100);
-  tft.printf("Z: %.0f (%.2fg)", zeroZ, (zeroZ - zeroZ)/330.0);
+  tft.printf("Z: %.0f (%.2fg)", zeroZ, (zeroZ-zeroZ)/330.0);
 
   delay(3000);
   state = MENU;
   drawWheel();
+}
+
+/* ---------- LIVE G SCREEN ---------- */
+void showLiveG() {
+  tft.fillScreen(BLACK);
+  tft.setTextSize(2);
+  tft.setTextColor(WHITE);
+  tft.setCursor(10, 20);
+  tft.print("Live G:");
 }
 
 /* ---------- SETUP ---------- */
@@ -300,6 +312,7 @@ void loop() {
           case 0: state = CLOCK; tft.fillScreen(BLACK); drawClockFace(); break;
           case 1: state = STEPS; stepCount = 0; showSteps(); break;
           case 2: state = CALIB; calibrate(); break;
+          case 3: state = LIVEG; lastG = 0; showLiveG(); break;
         }
       } else if (state == STEPS) {
         stepCount = 0; showSteps();
@@ -325,20 +338,15 @@ void loop() {
   // 5. Step detector state machine
   switch (stepState) {
     case STEP_IDLE:
-      if (filtMag > peakThreshold) {
-        stepState = STEP_PEAK_DETECTED;
-      }
+      if (filtMag > peakThreshold) stepState = STEP_PEAK_DETECTED;
       break;
-
     case STEP_PEAK_DETECTED:
       if (filtMag < valleyThreshold && (now - lastStep) > stepCooldown) {
         stepCount++;
         lastStep = now;
         lastStepT = now;
         stepState = STEP_IDLE;
-
         if (state == STEPS) showSteps();
-
         // cadence buffer
         stepTS[stepHead] = now;
         stepHead = (stepHead + 1) % CAD_BUF;
@@ -369,7 +377,23 @@ void loop() {
     }
   }
 
-  // 7. Serial debug
+  // 7. Live G updates
+  if (state == LIVEG && now - lastG > 200) {
+    lastG = now;
+    tft.fillScreen(BLACK);
+    tft.setTextSize(2);
+    tft.setTextColor(WHITE);
+    tft.setCursor(10, 20);
+    tft.print("Live G:");
+    tft.setCursor(10, 50);
+    tft.printf("X: %6.3fg", xg);
+    tft.setCursor(10, 80);
+    tft.printf("Y: %6.3fg", yg);
+    tft.setCursor(10,110);
+    tft.printf("Z: %6.3fg", zg);
+  }
+
+  // 8. Serial debug
   Serial.print(xg,3); Serial.print('\t');
   Serial.print(yg,3); Serial.print('\t');
   Serial.print(zg,3); Serial.print('\t');
