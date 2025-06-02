@@ -1,58 +1,67 @@
-/*************************************************************
-   STEP-TRACKER  –  ESP32-C3 + ADXL335 + GC9A01A round TFT
-   Rotary encoder (COM = GND):
-     CLK  → GPIO20  (INPUT_PULLUP)
-     DT   → GPIO21  (INPUT_PULLUP)
-     SW   → GPIO9   (INPUT_PULLDOWN)   // HIGH = pressed
-   Ext. LED → GPIO3  (active-LOW, 50 ms pulse)
-   On-board LED → GPIO8 (active-HIGH while SW held)
-*************************************************************/
+/*  STEP-TRACKER  (ESP32-C3  +  ADXL335  +  GC9A01A)
+    Wheel-style menu (using rotary encoder)
+      • Clock Mode
+      • Steps Count (with integrated pace bubble)
+      • Calibrate ADXL
+      • Live G (real-time X/Y/Z in g)
+    Features:
+      • 1-pole low-pass on |a|
+      • 8-step cadence average
+      • 4-state pace with debounce + idle timeout
+*/
 
 #include "SPI.h"
 #include "Adafruit_GC9A01A.h"
 #include <math.h>
 
-/* USER SETTINGS */
-float  stride_cm   = 70.0;
-float  weight_kg   = 70.0;
-const int   dailyGoal   = 8000;
-const float walkJog     = 4.5;
-const float jogRun      = 8.5;
-const unsigned long idleTimeout = 2000;
+/* ---------- USER SETTINGS ---------- */
+float  stride_cm     = 70.0;   // personalise!
+float  weight_kg     = 70.0;
+const int    dailyGoal     = 8000;
 
-/* DISPLAY */
-#define TFT_DC   10
-#define TFT_CS   -1
-#define TFT_RST  -1
-Adafruit_GC9A01A tft(TFT_CS, TFT_DC);
+/* WPIR thresholds (km h-1) */
+const float walkJog         = 4.5;
+const float jogRun          = 8.5;
+const unsigned long idleTimeout = 2000;   // ms: no steps → “STANDING”
+
+/* ---------- DISPLAY PINS ---------- */
+#define TFT_SCLK   4   // SCL → GPIO 4
+#define TFT_MOSI   6   // SDA → GPIO 6
+#define TFT_DC    10   // DC  → GPIO 10
+#define TFT_CS    -1   // CS  → GND
+#define TFT_RST    7   // RST → GPIO 7
+
+Adafruit_GC9A01A tft = Adafruit_GC9A01A(TFT_CS, TFT_DC, TFT_RST);
+
 #define BLACK    0x0000
 #define WHITE    0xFFFF
 #define GREEN    0x07E0
 #define RED      0xF800
 #define BLUE     0x001F
 #define YELLOW   0xFFE0
-#define GREY     0x8410
+#define GREY     0x8410      // mid-grey
 #define DARKGREY 0x7BEF
 
-/* I/O PINS */
-#define ENC_A       20
-#define ENC_B       21
-#define BTN_SW      9
-#define EXT_LED_IO  3
-#define ONBOARD_LED 8
-#define ADXL_X      A2
-#define ADXL_Y      A1
-#define ADXL_Z      A0
+/* ---------- ROTARY ENCODER PINS ---------- */
+#define ENC_A        20    // Encoder A (CLK)
+#define ENC_B        21    // Encoder B (DT)
+#define ENC_SW        9    // Encoder push‐switch (SW), HIGH when pressed
 
-/* MENU */
-const char* menuItems[] = { "Clock Mode", "Steps Count", "Calibrate ADXL", "WPIR" };
-const char* menuIcons[] = { "CLK", "STP", "CAL", "PCE" };
-const uint8_t menuLen = sizeof(menuItems)/sizeof(menuItems[0]);
+/* ---------- ADXL PINS ---------- */
+#define ADXL_X         A1
+#define ADXL_Y         A3
+#define ADXL_Z         A0
+
+/* ---------- MENU ---------- */
+const char* menuItems[] = { "Clock Mode", "Steps Count", "Calibrate ADXL", "Live G" };
+const char* menuIcons[] = { "CLK", "STP", "CAL", "GRA" };
+const uint8_t menuLen = sizeof(menuItems) / sizeof(menuItems[0]);
 uint8_t menuIdx = 0;
-enum AppState { MENU, CLOCK, STEPS, CALIB, WPIR };
+
+enum AppState { MENU, CLOCK, STEPS, CALIB, LIVEG };
 AppState state = MENU;
 
-/* ENCODER DECODE */
+/* ---------- ROTARY ENCODER DECODE ---------- */
 static uint8_t encPrev = 0;
 const int8_t encTab[16] = {
    0,-1, 1, 0,
@@ -60,156 +69,220 @@ const int8_t encTab[16] = {
   -1, 0, 0, 1,
    0, 1,-1, 0
 };
-
-/* DEBOUNCE SETTINGS */
-const unsigned long ENC_DB_MS   = 300;  // ms between encoder steps
-const unsigned long BTN_DB_MS   = 200;  // ms debounce for SELECT
-const unsigned long BTN_LONG_MS = 1000;  // ms long-press
+const unsigned long ENC_DB_MS = 100;  // ms between valid steps
 unsigned long lastEncTime = 0;
 
-/* SELECT state */
-bool selLast = LOW, selStable = LOW, longFired = false;
-unsigned long selEdge = 0, selStart = 0;
+/* ---------- BUTTON (ENC_SW) DEBOUNCE ---------- */
+const uint16_t BTN_DB_MS = 50, BTN_LONG_MS = 800;
+bool swLast = LOW, swStable = LOW, longFired = false;
+unsigned long swEdge = 0, swStart = 0;
 
-/* CLOCK */
-const uint8_t cx=120, cy=120, rad=100;
-uint8_t hh=12, mm=0, ss=0;
-float hA=0, mA=0, sA=0;
-int16_t pHX=cx, pHY=cy, pMX=cx, pMY=cy, pSX=cx, pSY=cy;
+/* ---------- RUNTIME VARS ---------- */
+const uint8_t cx = 120, cy = 120, rad = 100;
+uint8_t hh = 12, mm = 0, ss = 0;
+float hA = 0, mA = 0, sA = 0;
+int16_t pHX = cx, pHY = cy, pMX = cx, pMY = cy, pSX = cx, pSY = cy;
 
-/* STEPS */
-const double thMag=1.02, thDelta=0.03;
-const unsigned long cooldown=150;
-double zeroX=0, zeroY=0, zeroZ=0, prevMag=0, filtMag=0;
-const float alpha=0.25;
-bool stepArmed=false; unsigned long lastStep=0, lastStepT=0;
-int stepCount=0;
+/* step detect & smoothing */
+const float alpha = 0.10;
+double zeroX = 0, zeroY = 0, zeroZ = 0;
+double filtMag = 0;
 
-/* CADENCE */
-const uint8_t CAD_BUF=8;
-unsigned long stepTS[CAD_BUF]={0};
-uint8_t stepHead=0;
-float cadenceSPM=0;
+/* cadence buffer (8-step average) */
+const uint8_t CAD_BUF = 8;
+unsigned long stepTS[CAD_BUF] = { 0 };
+uint8_t stepHead = 0;
+float cadenceSPM = 0;
 
-/* PROTOTYPES */
+/* step-detector tuning */
+const double peakThreshold   = 1.30;   // g – minimum filtered magnitude for a peak
+const double valleyThreshold = 1.05;   // g – must drop below to arm next step
+const unsigned long stepCooldown = 400; // ms – min time between counts
+
+enum StepState { STEP_IDLE, STEP_PEAK_DETECTED };
+StepState stepState = STEP_IDLE;
+unsigned long lastStep = 0, lastStepT = 0;
+int stepCount = 0;
+
+/* for Live G updates */
+unsigned long lastG = 0;
+
+/* ---------- PROTOTYPES ---------- */
 void drawWheel();
 void drawClockFace();
 void hands();
 void showSteps();
-void paceBubble();
 void calibrate();
-void pulseExtLED();
+void showLiveG();
+void readEncoder();
+void handleSelect();
 
+/* ---------- SETUP ---------- */
 void setup() {
   Serial.begin(115200);
-  tft.begin(); tft.setRotation(0); tft.fillScreen(BLACK);
 
+  // Initialize SPI on custom pins:
+  SPI.begin(TFT_SCLK, -1, TFT_MOSI, -1);
+  tft.begin();
+  tft.setRotation(0);
+  tft.fillScreen(BLACK);
+
+  // Encoder pins
   pinMode(ENC_A, INPUT_PULLUP);
   pinMode(ENC_B, INPUT_PULLUP);
-  pinMode(BTN_SW, INPUT_PULLDOWN);
+  pinMode(ENC_SW, INPUT_PULLDOWN);
 
-  pinMode(EXT_LED_IO, OUTPUT);  digitalWrite(EXT_LED_IO, HIGH);
-  pinMode(ONBOARD_LED, INPUT);   // hi-Z so LED off, WP line safe
+  // ADXL pins (no pinMode needed; analogRead handles them)
 
-  encPrev = (digitalRead(ENC_A)<<1) | digitalRead(ENC_B);
+  // Seed encPrev
+  encPrev = (digitalRead(ENC_A) << 1) | digitalRead(ENC_B);
+
+  // Initial menu draw
   drawWheel();
 }
 
+/* ---------- LOOP ---------- */
 void loop() {
   unsigned long now = millis();
 
-  /* 1) ENCODER rotation */
-  uint8_t a = digitalRead(ENC_A);
-  uint8_t b = digitalRead(ENC_B);
-  int8_t move = encTab[(encPrev<<2)|(a<<1)|b];
-  encPrev = (a<<1)|b;
-  if(state==MENU && move) {
-    if(now - lastEncTime > ENC_DB_MS) {
-      menuIdx = (menuIdx + (move>0?1:-1) + menuLen) % menuLen;
-      drawWheel();
-      pulseExtLED();
-      lastEncTime = now;
-    }
-  }
+  // 1) READ ROTARY ENCODER FOR MENU NAVIGATION
+  readEncoder();
 
-  /* 2) SELECT button */
-  bool swRaw = digitalRead(BTN_SW);        // HIGH while pressed
+  // 2) HANDLE ENCODER PUSH-SWITCH (SELECT)
+  handleSelect();
 
-  // drive onboard LED on press
-  if(swRaw) pinMode(ONBOARD_LED, OUTPUT), digitalWrite(ONBOARD_LED, HIGH);
-  else     pinMode(ONBOARD_LED, INPUT);
+  // 3) READ ADXL & compute magnitude
+  int xr = analogRead(ADXL_X), yr = analogRead(ADXL_Y), zr = analogRead(ADXL_Z);
+  double xg = (xr - zeroX) / 330.0, yg = (yr - zeroY) / 330.0, zg = (zr - zeroZ) / 330.0;
+  double mag = sqrt(xg * xg + yg * yg + zg * zg);
 
-  // debounce & long-press
-  if(swRaw != selLast) { selEdge = now; selLast = swRaw; }
-  if(now - selEdge > BTN_DB_MS && swRaw != selStable) {
-    selStable = swRaw;
-    if(selStable == HIGH) { selStart = now; longFired = false; }
-    else if(!longFired && now - selStart < BTN_LONG_MS) {
-      pulseExtLED();
-      if(state==MENU) {
-        switch(menuIdx) {
-          case 0: state=CLOCK; tft.fillScreen(BLACK); drawClockFace(); break;
-          case 1: state=STEPS; stepCount=0; showSteps(); break;
-          case 2: state=CALIB; calibrate(); break;
-          case 3: state=WPIR;  paceBubble(); break;
+  // 4) LOW-PASS FILTER
+  filtMag = filtMag * (1.0 - alpha) + mag * alpha;
+
+  // 5) STEP DETECTION STATE MACHINE
+  double diff = fabs(filtMag - (diff = filtMag)); // store prevMag = diff
+  static double prevMag = 0;
+  diff = fabs(filtMag - prevMag);
+  if (state == STEPS || state == LIVEG) {
+    if (stepState == STEP_IDLE) {
+      if (filtMag > peakThreshold) {
+        stepState = STEP_PEAK_DETECTED;
+      }
+    } else if (stepState == STEP_PEAK_DETECTED) {
+      if (filtMag < valleyThreshold && (now - lastStep) > stepCooldown) {
+        stepCount++;
+        lastStep = now;
+        lastStepT = now;
+        stepState = STEP_IDLE;
+        // cadence buffer
+        stepTS[stepHead] = now;
+        stepHead = (stepHead + 1) % CAD_BUF;
+        if (stepTS[stepHead]) {
+          float avgInt = (now - stepTS[stepHead]) / float(CAD_BUF);
+          cadenceSPM = 60000.0 / avgInt;
         }
-      } else if(state==STEPS) {
-        stepCount=0; showSteps();
+        if (state == STEPS)  showSteps();
+        if (state == LIVEG) showLiveG(); // treat Live G similar to WPIR
       }
     }
   }
-  if(selStable==HIGH && !longFired && now-selStart>=BTN_LONG_MS) {
-    longFired = true;
-    if(state!=MENU) { state=MENU; drawWheel(); pulseExtLED(); }
-  }
-
-  /* 3) READ ADXL */
-  int xr=analogRead(ADXL_X), yr=analogRead(ADXL_Y), zr=analogRead(ADXL_Z);
-  double xg=(xr-zeroX)/330.0, yg=(yr-zeroY)/330.0, zg=(zr-zeroZ)/330.0;
-  double mag = sqrt(xg*xg + yg*yg + zg*zg);
-
-  /* 4) FILTER & STEP DETECT */
-  filtMag = filtMag*(1.0-alpha) + mag*alpha;
-  double diff = fabs(filtMag - prevMag);
-  if(!stepArmed && diff>thDelta && filtMag>thMag && now-lastStep>cooldown) {
-    stepArmed=true; stepCount++; lastStep=now;
-    stepTS[stepHead]=now; stepHead=(stepHead+1)%CAD_BUF;
-    if(stepTS[stepHead]) {
-      float avg=(now-stepTS[stepHead])/float(CAD_BUF);
-      cadenceSPM = 60000.0/avg;
-    }
-    lastStepT = now;
-    if(state==STEPS) showSteps();
-    if(state==WPIR)  paceBubble();
-  }
-  if(stepArmed && diff<(thDelta/2)) stepArmed=false;
   prevMag = filtMag;
 
-  /* 5) CLOCK */
-  if(state==CLOCK) {
-    static unsigned long tick=0;
-    if(now-tick>=1000) {
-      tick=now; if(++ss>=60){ss=0;if(++mm>=60){mm=0;if(++hh>12)hh=1;}}
-      sA=map(ss,0,60,0,360); mA=map(mm,0,60,0,360); hA=map(hh%12,0,12,0,360);
+  // 6) CLOCK UPDATE (once per second)
+  if (state == CLOCK) {
+    static unsigned long tick = 0;
+    if (now - tick >= 1000) {
+      tick = now;
+      if (++ss >= 60) {
+        ss = 0;
+        if (++mm >= 60) {
+          mm = 0;
+          if (++hh > 12) hh = 1;
+        }
+      }
+      sA = map(ss, 0, 60, 0, 360);
+      mA = map(mm, 0, 60, 0, 360);
+      hA = map(hh % 12, 0, 12, 0, 360);
       hands();
     }
   }
 
-  /* 6) Serial Plot */
-  Serial.print(xg,3); Serial.print('\t');
-  Serial.print(yg,3); Serial.print('\t');
-  Serial.print(zg,3); Serial.print('\t');
-  Serial.println(filtMag,3);
+  // 7) SERIAL DEBUG (for plotting)
+  Serial.print(xg, 3); Serial.print('\t');
+  Serial.print(yg, 3); Serial.print('\t');
+  Serial.print(zg, 3); Serial.print('\t');
+  Serial.println(filtMag, 3);
 }
 
-/* LED pulse on GPIO3 */
-void pulseExtLED(){
-  digitalWrite(EXT_LED_IO, LOW);
-  delay(50);
-  digitalWrite(EXT_LED_IO, HIGH);
+/* ---------- READ ENCODER FUNCTION ---------- */
+void readEncoder() {
+  unsigned long now = millis();
+  uint8_t a = digitalRead(ENC_A);
+  uint8_t b = digitalRead(ENC_B);
+  int8_t move = encTab[(encPrev << 2) | (a << 1) | b];
+  encPrev = (a << 1) | b;
+
+  if (state == MENU && move != 0 && (now - lastEncTime) > ENC_DB_MS) {
+    menuIdx = (menuIdx + (move > 0 ? 1 : -1) + menuLen) % menuLen;
+    drawWheel();
+    lastEncTime = now;
+  }
 }
 
-/* ---------- WHEEL MENU ---------- */
+/* ---------- HANDLE SELECT BUTTON ---------- */
+void handleSelect() {
+  unsigned long now = millis();
+  bool swRaw = digitalRead(ENC_SW); // HIGH while pressed
+
+  if (swRaw != swLast) {
+    swEdge = now;
+    swLast = swRaw;
+  }
+  if ((now - swEdge) > BTN_DB_MS && swRaw != swStable) {
+    swStable = swRaw;
+    if (swStable == HIGH) {
+      swStart = now;
+      longFired = false;
+    } else if (!longFired && (now - swStart) < BTN_LONG_MS) {
+      // Short press action
+      if (state == MENU) {
+        switch (menuIdx) {
+          case 0:
+            state = CLOCK;
+            tft.fillScreen(BLACK);
+            drawClockFace();
+            break;
+          case 1:
+            state = STEPS;
+            stepCount = 0;
+            showSteps();
+            break;
+          case 2:
+            state = CALIB;
+            calibrate();
+            break;
+          case 3:
+            state = LIVEG;
+            lastG = 0;
+            showLiveG();
+            break;
+        }
+      } else if (state == STEPS) {
+        stepCount = 0;
+        showSteps();
+      }
+    }
+  }
+  if (swStable == HIGH && !longFired && (now - swStart) >= BTN_LONG_MS) {
+    longFired = true;
+    if (state != MENU) {
+      state = MENU;
+      drawWheel();
+    }
+  }
+}
+
+/* ---------- DRAW WHEEL MENU ---------- */
 void drawWheel() {
   tft.fillScreen(BLACK);
   const int16_t rIcon = 80;
@@ -221,25 +294,29 @@ void drawWheel() {
     int16_t y = cy + rIcon * sin(ang);
     uint8_t sz = (off == 0) ? 3 : 2;
     uint16_t col = (off == 0) ? GREEN : WHITE;
-    tft.setTextSize(sz); tft.setTextColor(col, BLACK);
+    tft.setTextSize(sz);
+    tft.setTextColor(col, BLACK);
     int16_t w = strlen(menuIcons[i]) * 6 * sz;
-    tft.setCursor(x - w / 2, y - 4 * sz);
+    tft.setCursor(x - w/2, y - 4*sz);
     tft.print(menuIcons[i]);
   }
-  tft.setTextSize(2); tft.setTextColor(WHITE, BLACK);
+  tft.setTextSize(2);
+  tft.setTextColor(WHITE, BLACK);
   int16_t w = strlen(menuItems[menuIdx]) * 12;
-  tft.setCursor(cx - w / 2, cy + 50);
+  tft.setCursor(cx - w/2, cy + 50);
   tft.print(menuItems[menuIdx]);
 }
 
-/* ---------- CLOCK FACE + HANDS ---------- */
+/* ---------- CLOCK FACE & HANDS ---------- */
 void drawClockFace() {
   tft.drawCircle(cx, cy, rad, WHITE);
   for (uint8_t i = 1; i <= 12; i++) {
     float a = map(i, 1, 12, 0, 360);
     int x = cx + (rad - 20) * cos(radians(a - 90));
     int y = cy + (rad - 20) * sin(radians(a - 90));
-    tft.setCursor(x - 8, y - 8); tft.setTextColor(WHITE); tft.setTextSize(2);
+    tft.setCursor(x - 8, y - 8);
+    tft.setTextColor(WHITE);
+    tft.setTextSize(2);
     tft.print(i);
   }
 }
@@ -264,9 +341,10 @@ void hands() {
 /* ---------- STEPS SCREEN ---------- */
 void showSteps() {
   float dist_km = (stepCount * stride_cm) / 100000.0;
-  float kcal = dist_km * weight_kg * 1.036;
+  float kcal    = dist_km * weight_kg * 1.036;
   tft.fillScreen(BLACK);
-  tft.setTextColor(WHITE); tft.setTextSize(3);
+  tft.setTextColor(WHITE);
+  tft.setTextSize(3);
   tft.setCursor(30, 60);  tft.print("Steps:");
   tft.setCursor(60, 100); tft.print(stepCount);
   tft.setTextSize(2);
@@ -277,58 +355,64 @@ void showSteps() {
   tft.fillRect(10, 210, w, 10, GREEN);
 }
 
-/* ---------- WPIR BUBBLE ---------- */
-void paceBubble() {
-  bool idle = (millis() - lastStepT > idleTimeout);
-  float speed_kmh = (stride_cm / 100.0) * cadenceSPM * 0.06;
-
-  uint8_t desired;
-  if (idle)                  desired = 0;
-  else if (speed_kmh > jogRun) desired = 3;
-  else if (speed_kmh > walkJog)desired = 2;
-  else                        desired = 1;
-
-  static uint8_t state = 0; static unsigned long stable = 0;
-  if (desired != state) {
-    if (millis() - stable > 600) state = desired;
-  } else stable = millis();
-
-  const uint16_t colLUT[4] = { GREY, GREEN, YELLOW, RED };
-  const char*    txtLUT[4] = { "STANDING", "WALKING", "JOGGING", "RUNNING" };
-
+/* ---------- LIVE G SCREEN ---------- */
+void showLiveG() {
   tft.fillScreen(BLACK);
-  tft.fillCircle(cx, cy - 20, 40, colLUT[state]);
-  tft.setTextSize(2); tft.setTextColor(WHITE, BLACK);
-  int16_t w = strlen(txtLUT[state]) * 12;
-  tft.setCursor(cx - w / 2, cy + 35); tft.print(txtLUT[state]);
+  tft.setTextSize(2);
+  tft.setTextColor(WHITE);
+  tft.setCursor(10, 20);
+  tft.print("Live G:");
+  // Also display X/Y/Z values
+  // (This will be refreshed on each new step in LIVEG mode)
+  int xr = analogRead(ADXL_X), yr = analogRead(ADXL_Y), zr = analogRead(ADXL_Z);
+  double xg = (xr - zeroX) / 330.0, yg = (yr - zeroY) / 330.0, zg = (zr - zeroZ) / 330.0;
+  tft.setCursor(10, 50); tft.printf("X: %6.3fg", xg);
+  tft.setCursor(10, 80); tft.printf("Y: %6.3fg", yg);
+  tft.setCursor(10,110); tft.printf("Z: %6.3fg", zg);
 }
 
 /* ---------- CALIBRATION ---------- */
 void calibrate() {
   struct F { const char* l; uint8_t p; double* s; } f[6] = {
-    {"+X", ADXL_X, &zeroX}, {"-X", ADXL_X, &zeroX},
-    {"+Y", ADXL_Y, &zeroY}, {"-Y", ADXL_Y, &zeroY},
-    {"+Z", ADXL_Z, &zeroZ}, {"-Z", ADXL_Z, &zeroZ}
+    { "+X", ADXL_X, &zeroX }, { "-X", ADXL_X, &zeroX },
+    { "+Y", ADXL_Y, &zeroY }, { "-Y", ADXL_Y, &zeroY },
+    { "+Z", ADXL_Z, &zeroZ }, { "-Z", ADXL_Z, &zeroZ }
   };
   double pos[3] = {0}, neg[3] = {0};
-  const uint16_t N = 100; const uint32_t wait = 5000;
+  const uint16_t N = 100;
+  const uint32_t wait = 5000;
+
   for (uint8_t i = 0; i < 6; i++) {
     tft.fillScreen(BLACK);
-    tft.setTextSize(2); tft.setTextColor(WHITE);
-    tft.setCursor(30, 60); tft.print("Face "); tft.print(f[i].l);
-    tft.setCursor(10, 120); tft.print("Hold 5 s");
+    tft.setTextSize(2);
+    tft.setTextColor(WHITE);
+    tft.setCursor(30, 60);
+    tft.print("Face "); tft.print(f[i].l);
+    tft.setCursor(10, 120);
+    tft.print("Hold 5 s");
     unsigned long st = millis();
     while (millis() - st < wait) delay(1);
+
     double sum = 0;
-    for (uint16_t s = 0; s < N; s++) { sum += analogRead(f[i].p); delay(5); }
-    (i % 2 == 0 ? pos : neg)[i / 2] = sum / N;
+    for (uint16_t s = 0; s < N; s++) {
+      sum += analogRead(f[i].p);
+      delay(5);
+    }
+    if (i % 2 == 0) pos[i/2] = sum / N;
+    else           neg[i/2] = sum / N;
   }
+
   zeroX = (pos[0] + neg[0]) / 2;
   zeroY = (pos[1] + neg[1]) / 2;
   zeroZ = (pos[2] + neg[2]) / 2;
+
   tft.fillScreen(BLACK);
+  tft.setTextSize(2);
+  tft.setTextColor(WHITE);
   tft.setCursor(35, 100);
   tft.print("Calibration OK");
   delay(2000);
-  state = MENU; drawWheel();
+
+  state = MENU;
+  drawWheel();
 }
