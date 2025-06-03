@@ -24,6 +24,7 @@ const float walkJog         = 4.5;
 const float jogRun          = 8.5;
 const unsigned long idleTimeout = 2000;   // ms: no steps → “STANDING”
 
+
 /* ---------- DISPLAY PINS ---------- */
 #define TFT_SCLK   4   // SCL → GPIO 4
 #define TFT_MOSI   6   // SDA → GPIO 6
@@ -42,15 +43,46 @@ Adafruit_GC9A01A tft = Adafruit_GC9A01A(TFT_CS, TFT_DC, TFT_RST);
 #define GREY     0x8410      // mid-grey
 #define DARKGREY 0x7BEF
 
+
 /* ---------- ROTARY ENCODER PINS ---------- */
 #define ENC_A        20    // Encoder A (CLK)
 #define ENC_B        21    // Encoder B (DT)
 #define ENC_SW        9    // Encoder push‐switch (SW), HIGH when pressed
 
+
+/* ---------- ROTARY‐DECODE & SENSITIVITY ---------- */
+static uint8_t encPrev = 0;
+const int8_t encTab[16] = {
+   0,-1, 1, 0,
+   1, 0, 0,-1,
+  -1, 0, 0, 1,
+   0, 1,-1, 0
+};
+const unsigned long ENC_DB_MS = 100;  // ms between valid detents
+unsigned long lastEncTime = 0;
+
+/* require N detents per menu move */
+const uint8_t ENC_STEPS_PER_ITEM = 3;  // number of clicks needed to change one menu item
+int8_t encAccumulator = 0;             // tallies each detent
+
+
+/* ---------- BUTTON (ENC_SW) DEBOUNCE & DOUBLE‐CLICK ---------- */
+const uint16_t BTN_DB_MS        = 5;    // ms debounce for push‐switch (shorter for quicker response)
+const uint16_t DOUBLE_CLICK_MS  = 500;  // max gap (ms) between two presses for a “double click”
+
+bool swLast = LOW, swStable = LOW;
+unsigned long swEdge = 0;
+
+/* track double‐click state */
+unsigned long lastClickTime = 0;
+uint8_t clickCount = 0;
+
+
 /* ---------- ADXL PINS ---------- */
 #define ADXL_X         A1
 #define ADXL_Y         A3
 #define ADXL_Z         A0
+
 
 /* ---------- MENU ---------- */
 const char* menuItems[] = { "Clock Mode", "Steps Count", "Calibrate ADXL", "Live G" };
@@ -61,21 +93,6 @@ uint8_t menuIdx = 0;
 enum AppState { MENU, CLOCK, STEPS, CALIB, LIVEG };
 AppState state = MENU;
 
-/* ---------- ROTARY ENCODER DECODE ---------- */
-static uint8_t encPrev = 0;
-const int8_t encTab[16] = {
-   0,-1, 1, 0,
-   1, 0, 0,-1,
-  -1, 0, 0, 1,
-   0, 1,-1, 0
-};
-const unsigned long ENC_DB_MS = 100;  // ms between valid steps
-unsigned long lastEncTime = 0;
-
-/* ---------- BUTTON (ENC_SW) DEBOUNCE ---------- */
-const uint16_t BTN_DB_MS = 50, BTN_LONG_MS = 800;
-bool swLast = LOW, swStable = LOW, longFired = false;
-unsigned long swEdge = 0, swStart = 0;
 
 /* ---------- RUNTIME VARS ---------- */
 const uint8_t cx = 120, cy = 120, rad = 100;
@@ -95,9 +112,9 @@ uint8_t stepHead = 0;
 float cadenceSPM = 0;
 
 /* step-detector tuning */
-const double peakThreshold   = 1.30;   // g – minimum filtered magnitude for a peak
-const double valleyThreshold = 1.05;   // g – must drop below to arm next step
-const unsigned long stepCooldown = 400; // ms – min time between counts
+const double peakThreshold   = 1.00;   // g – minimum filtered magnitude for a peak
+const double valleyThreshold = 0.98;   // g – must drop below to arm next step
+const unsigned long stepCooldown = 100; // ms – min time between counts
 
 enum StepState { STEP_IDLE, STEP_PEAK_DETECTED };
 StepState stepState = STEP_IDLE;
@@ -106,6 +123,7 @@ int stepCount = 0;
 
 /* for Live G updates */
 unsigned long lastG = 0;
+
 
 /* ---------- PROTOTYPES ---------- */
 void drawWheel();
@@ -117,6 +135,7 @@ void showLiveG();
 void readEncoder();
 void handleSelect();
 
+
 /* ---------- SETUP ---------- */
 void setup() {
   Serial.begin(115200);
@@ -127,19 +146,20 @@ void setup() {
   tft.setRotation(0);
   tft.fillScreen(BLACK);
 
-  // Encoder pins
+  // Encoder pins:
   pinMode(ENC_A, INPUT_PULLUP);
   pinMode(ENC_B, INPUT_PULLUP);
-  pinMode(ENC_SW, INPUT_PULLDOWN);
+  pinMode(ENC_SW, INPUT_PULLUP);  // use internal pull-up for cleaner reads
 
-  // ADXL pins (no pinMode needed; analogRead handles them)
+  // ADXL pins: no pinMode needed; analogRead handles them
 
-  // Seed encPrev
+  // Seed encPrev:
   encPrev = (digitalRead(ENC_A) << 1) | digitalRead(ENC_B);
 
-  // Initial menu draw
+  // Initial menu draw:
   drawWheel();
 }
+
 
 /* ---------- LOOP ---------- */
 void loop() {
@@ -148,7 +168,7 @@ void loop() {
   // 1) READ ROTARY ENCODER FOR MENU NAVIGATION
   readEncoder();
 
-  // 2) HANDLE ENCODER PUSH-SWITCH (SELECT)
+  // 2) HANDLE ENCODER PUSH-SWITCH (SELECT / RESET / EXIT)
   handleSelect();
 
   // 3) READ ADXL & compute magnitude
@@ -160,9 +180,7 @@ void loop() {
   filtMag = filtMag * (1.0 - alpha) + mag * alpha;
 
   // 5) STEP DETECTION STATE MACHINE
-  double diff = fabs(filtMag - (diff = filtMag)); // store prevMag = diff
   static double prevMag = 0;
-  diff = fabs(filtMag - prevMag);
   if (state == STEPS || state == LIVEG) {
     if (stepState == STEP_IDLE) {
       if (filtMag > peakThreshold) {
@@ -182,7 +200,7 @@ void loop() {
           cadenceSPM = 60000.0 / avgInt;
         }
         if (state == STEPS)  showSteps();
-        if (state == LIVEG) showLiveG(); // treat Live G similar to WPIR
+        if (state == LIVEG) showLiveG(); // in LIVEG mode, also refresh display
       }
     }
   }
@@ -214,6 +232,7 @@ void loop() {
   Serial.println(filtMag, 3);
 }
 
+
 /* ---------- READ ENCODER FUNCTION ---------- */
 void readEncoder() {
   unsigned long now = millis();
@@ -223,29 +242,51 @@ void readEncoder() {
   encPrev = (a << 1) | b;
 
   if (state == MENU && move != 0 && (now - lastEncTime) > ENC_DB_MS) {
-    menuIdx = (menuIdx + (move > 0 ? 1 : -1) + menuLen) % menuLen;
-    drawWheel();
     lastEncTime = now;
+
+    // accumulate each detent (+1 or –1)
+    encAccumulator += (move > 0 ? 1 : -1);
+
+    // only scroll when accumulator reaches ±ENC_STEPS_PER_ITEM
+    if (encAccumulator >=  ENC_STEPS_PER_ITEM) {
+      menuIdx = (menuIdx + 1) % menuLen;
+      encAccumulator = 0;
+      drawWheel();
+    }
+    else if (encAccumulator <= -ENC_STEPS_PER_ITEM) {
+      menuIdx = (menuIdx - 1 + menuLen) % menuLen;
+      encAccumulator = 0;
+      drawWheel();
+    }
   }
 }
 
-/* ---------- HANDLE SELECT BUTTON ---------- */
+
+/* ---------- HANDLE SELECT BUTTON (DOUBLE-CLICK EXIT) ---------- */
 void handleSelect() {
   unsigned long now = millis();
-  bool swRaw = digitalRead(ENC_SW); // HIGH while pressed
+  bool swRaw = (digitalRead(ENC_SW) == LOW); // pressed when pulled LOW
 
+  // 1) Debounce edge detection
   if (swRaw != swLast) {
     swEdge = now;
     swLast = swRaw;
   }
+
+  // 2) Once stable for BTN_DB_MS, register new state
   if ((now - swEdge) > BTN_DB_MS && swRaw != swStable) {
     swStable = swRaw;
-    if (swStable == HIGH) {
-      swStart = now;
-      longFired = false;
-    } else if (!longFired && (now - swStart) < BTN_LONG_MS) {
-      // Short press action
+
+    // a) On button‐down (short press start) – just note it
+    if (swStable == true) {
+      // nothing immediate here; action on release
+    }
+    // b) On button‐up (short press end), handle clicks
+    else {
+      // detect a “click” (pressed then released)
+      // In MENU: enter option on first click
       if (state == MENU) {
+        clickCount = 0; // reset any pending double-click state
         switch (menuIdx) {
           case 0:
             state = CLOCK;
@@ -267,20 +308,62 @@ void handleSelect() {
             showLiveG();
             break;
         }
-      } else if (state == STEPS) {
-        stepCount = 0;
-        showSteps();
+      }
+      // In any mode ≠ MENU: use double‐click to exit
+      else {
+        clickCount++;
+        if (clickCount == 1) {
+          lastClickTime = now;
+          // treat this click as “reset” in that mode:
+          if (state == STEPS) {
+            stepCount = 0;
+            showSteps();
+          }
+          else if (state == CLOCK) {
+            hh = 12; mm = 0; ss = 0;
+            hA = mA = sA = 0;
+            tft.fillScreen(BLACK);
+            drawClockFace();
+          }
+          else if (state == LIVEG) {
+            showLiveG();
+          }
+          // CALIB: ignore single clicks
+        }
+        else if (clickCount == 2 && (now - lastClickTime) <= DOUBLE_CLICK_MS) {
+          // second click within window → exit to MENU
+          state = MENU;
+          drawWheel();
+          clickCount = 0;
+        }
+        else {
+          // gap too large → treat as fresh single click
+          clickCount = 1;
+          lastClickTime = now;
+          if (state == STEPS) {
+            stepCount = 0;
+            showSteps();
+          }
+          else if (state == CLOCK) {
+            hh = 12; mm = 0; ss = 0;
+            hA = mA = sA = 0;
+            tft.fillScreen(BLACK);
+            drawClockFace();
+          }
+          else if (state == LIVEG) {
+            showLiveG();
+          }
+        }
       }
     }
   }
-  if (swStable == HIGH && !longFired && (now - swStart) >= BTN_LONG_MS) {
-    longFired = true;
-    if (state != MENU) {
-      state = MENU;
-      drawWheel();
-    }
+
+  // 3) If single-click waiting window has passed, reset clickCount
+  if (clickCount == 1 && (now - lastClickTime) > DOUBLE_CLICK_MS) {
+    clickCount = 0;
   }
 }
+
 
 /* ---------- DRAW WHEEL MENU ---------- */
 void drawWheel() {
@@ -306,6 +389,7 @@ void drawWheel() {
   tft.setCursor(cx - w/2, cy + 50);
   tft.print(menuItems[menuIdx]);
 }
+
 
 /* ---------- CLOCK FACE & HANDS ---------- */
 void drawClockFace() {
@@ -338,6 +422,7 @@ void hands() {
   tft.drawLine(cx, cy, pSX, pSY, GREEN);
 }
 
+
 /* ---------- STEPS SCREEN ---------- */
 void showSteps() {
   float dist_km = (stepCount * stride_cm) / 100000.0;
@@ -355,6 +440,7 @@ void showSteps() {
   tft.fillRect(10, 210, w, 10, GREEN);
 }
 
+
 /* ---------- LIVE G SCREEN ---------- */
 void showLiveG() {
   tft.fillScreen(BLACK);
@@ -362,14 +448,14 @@ void showLiveG() {
   tft.setTextColor(WHITE);
   tft.setCursor(10, 20);
   tft.print("Live G:");
-  // Also display X/Y/Z values
-  // (This will be refreshed on each new step in LIVEG mode)
+  // Also display X/Y/Z values (refreshed on each click/state change)
   int xr = analogRead(ADXL_X), yr = analogRead(ADXL_Y), zr = analogRead(ADXL_Z);
   double xg = (xr - zeroX) / 330.0, yg = (yr - zeroY) / 330.0, zg = (zr - zeroZ) / 330.0;
   tft.setCursor(10, 50); tft.printf("X: %6.3fg", xg);
   tft.setCursor(10, 80); tft.printf("Y: %6.3fg", yg);
   tft.setCursor(10,110); tft.printf("Z: %6.3fg", zg);
 }
+
 
 /* ---------- CALIBRATION ---------- */
 void calibrate() {
